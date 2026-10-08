@@ -96,6 +96,9 @@ export const makePlayerStore = (id?: string): StoreApi<PlayerState> => {
         | undefined,
     ) => set(() => ({ videoRef })),
 
+    watchStartTime: null,
+    setWatchStartTime: (watchStartTime) => set(() => ({ watchStartTime })),
+
     pipMode: false,
     setPipMode: (pipMode: boolean) => set(() => ({ pipMode })),
 
@@ -298,6 +301,11 @@ export const useOffline = () => {
   }
   return now - Date.parse(segment.startTime) > 10000;
 };
+
+export const useWatchStartTime = () => usePlayerStore((x) => x.watchStartTime);
+
+export const useSetWatchStartTime = () =>
+  usePlayerStore((x) => x.setWatchStartTime);
 
 export const useIsMyStream = () => {
   const myHandle = useStreamplaceStore((state) => state.handle);

@@ -8,9 +8,15 @@ import {
   useMuted,
   usePlayerStore,
   useSetMuted,
+  useStreamStartMs,
   useStreamplaceStore,
+  useWatchStartTime,
 } from "../..";
 import { borderRadius, colors, mt } from "../../lib/theme/atoms";
+import {
+  elementStartTimeTarget,
+  hlsStartTimeTarget,
+} from "../../lib/timestamp";
 import { Text, View } from "../ui/index";
 import { Loader } from "../ui/loader";
 import { srcToUrl } from "./shared";
@@ -39,6 +45,8 @@ type VideoProps = {
   videoRef?: React.RefObject<HTMLVideoElement | null>;
   objectFit?: "contain" | "cover";
   pictureInPictureEnabled?: boolean;
+  /** Seek to the temporal reference (#t=…) once metadata has loaded. */
+  seekToStart?: boolean;
 };
 
 function useVideoDimensions(
@@ -79,12 +87,34 @@ export default function WebVideo(props?: {
   pictureInPictureEnabled?: boolean;
 }) {
   const inProto = usePlayerStore((x) => x.protocol);
+  const setProtocol = usePlayerStore((x) => x.setProtocol);
+  const watchStartTime = useWatchStartTime();
   const isIngesting = usePlayerStore((x) => x.ingestConnectionState !== null);
   const selectedRendition = usePlayerStore((x) => x.selectedRendition);
   const src = usePlayerStore((x) => x.src);
   const setPlayerWidth = usePlayerStore((x) => x.setPlayerWidth);
   const setPlayerHeight = usePlayerStore((x) => x.setPlayerHeight);
-  const { url, protocol } = srcToUrl({ src: src, selectedRendition }, inProto);
+
+  // A temporal reference (#t=…) names a point in the timeline, which needs a
+  // seekable protocol — WebRTC has no timeline, so fall back to HLS for it.
+  // Applied once: a later explicit protocol choice (back to WebRTC/live) is
+  // honored rather than fought.
+  const [protoFallbackApplied, setProtoFallbackApplied] = useState(false);
+  const useHlsFallback =
+    !protoFallbackApplied &&
+    watchStartTime != null &&
+    inProto === PlayerProtocol.WEBRTC;
+  useEffect(() => {
+    if (useHlsFallback) {
+      setProtoFallbackApplied(true);
+      setProtocol(PlayerProtocol.HLS);
+    }
+  }, [useHlsFallback, setProtocol]);
+
+  const { url, protocol } = srcToUrl(
+    { src: src, selectedRendition },
+    useHlsFallback ? PlayerProtocol.HLS : inProto,
+  );
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const dimensions = useVideoDimensions(videoRef);
@@ -148,6 +178,8 @@ const VideoElement = forwardRef<
   const setStatus = usePlayerStore((x) => x.setStatus);
   const setUserInteraction = usePlayerStore((x) => x.setUserInteraction);
   const setVideoRef = usePlayerStore((x) => x.setVideoRef);
+  const watchStartTime = useWatchStartTime();
+  const streamStartMs = useStreamStartMs();
 
   const event = (evType) => (e) => {
     console.log(evType);
@@ -256,6 +288,28 @@ const VideoElement = forwardRef<
     (localVideoRef as any).current = videoElement;
   };
 
+  const handleLoadedMetadata = (e) => {
+    event("loadedmetadata")(e);
+    if (!props.seekToStart) {
+      return;
+    }
+    const video = localVideoRef.current;
+    if (!video || watchStartTime == null) {
+      return;
+    }
+    const target = elementStartTimeTarget({
+      watchStartTime,
+      streamStartMs,
+      seekable: video.seekable,
+      duration: video.duration,
+    });
+    if (target == null) {
+      return;
+    }
+    console.log("seeking to temporal reference", watchStartTime, "->", target);
+    video.currentTime = target;
+  };
+
   const eventLogger = (evType) => (e) => {
     console.log("📺 Video event:", evType);
     const now = new Date();
@@ -286,7 +340,7 @@ const VideoElement = forwardRef<
       onEnded={event("ended")}
       onError={event("error")}
       onLoadedData={event("loadeddata")}
-      onLoadedMetadata={event("loadedmetadata")}
+      onLoadedMetadata={handleLoadedMetadata}
       onLoadStart={event("loadstart")}
       onPause={event("pause")}
       onPlay={event("play")}
@@ -313,15 +367,58 @@ const VideoElement = forwardRef<
 });
 
 export function ProgressiveMP4Player(props: VideoProps) {
-  return <VideoElement {...props} />;
+  return <VideoElement {...props} seekToStart />;
 }
 
 export function ProgressiveWebMPlayer(props: VideoProps) {
-  return <VideoElement {...props} />;
+  return <VideoElement {...props} seekToStart />;
 }
 
 export function HLSPlayer(props: VideoProps) {
   const localRef = useRef<HTMLVideoElement | null>(null);
+  const watchStartTime = useWatchStartTime();
+  const streamStartMs = useStreamStartMs();
+
+  // The effect below is keyed on the URL alone — re-creating the hls.js
+  // instance just because these arrived late would restart playback. The
+  // livestream record (and with it the anchor) comes over the websocket, so
+  // the event handlers below read both through this always-current ref.
+  const seekInput = useRef({ watchStartTime, streamStartMs });
+  seekInput.current = { watchStartTime, streamStartMs };
+
+  const seekToTarget = (target: number) => {
+    const video = localRef.current;
+    if (!video) {
+      return;
+    }
+    console.log(
+      "seeking to temporal reference",
+      seekInput.current.watchStartTime,
+      "->",
+      target,
+    );
+    video.currentTime = target;
+  };
+
+  // Apply a temporal reference (#t=…) to a plain video element once its
+  // metadata is in (Safari's native HLS). The element exposes no program
+  // dates, so live positions are approximate; hls.js is exact (below).
+  const seekElementToStart = () => {
+    const video = localRef.current;
+    const { watchStartTime, streamStartMs } = seekInput.current;
+    if (!video || watchStartTime == null) {
+      return;
+    }
+    const target = elementStartTimeTarget({
+      watchStartTime,
+      streamStartMs,
+      seekable: video.seekable,
+      duration: video.duration,
+    });
+    if (target != null) {
+      seekToTarget(target);
+    }
+  };
 
   useEffect(() => {
     if (!localRef.current) {
@@ -337,6 +434,47 @@ export function HLSPlayer(props: VideoProps) {
         hls.stopLoad();
         return;
       }
+      // Seek to the temporal reference once level details are in: fragment
+      // program dates map the requested wall-clock instant onto the media
+      // timeline exactly. Live playlists refresh, so the handler stays
+      // attached until it reaches a definitive landing — a seek (possibly
+      // correcting an earlier approximate one once the anchor arrives), or
+      // "at the live edge, stay live".
+      let seekedWithoutAnchor = false;
+      const onLevelUpdated = (_e, data) => {
+        const video = localRef.current;
+        if (!video) {
+          return;
+        }
+        const { watchStartTime, streamStartMs } = seekInput.current;
+        if (watchStartTime == null) {
+          hls.off(Hls.Events.LEVEL_UPDATED, onLevelUpdated);
+          return;
+        }
+        const anchored = streamStartMs != null;
+        if (!data.details.live || anchored || !seekedWithoutAnchor) {
+          const target = hlsStartTimeTarget({
+            watchStartTime,
+            streamStartMs,
+            fragments: data.details.fragments,
+            live: data.details.live,
+            duration: data.details.duration,
+          });
+          if (!data.details.live || anchored) {
+            // VOD offsets are media positions; an anchored live offset is a
+            // fixed point in time. Either way this landing is definitive.
+            hls.off(Hls.Events.LEVEL_UPDATED, onLevelUpdated);
+          } else {
+            // Live but the anchor hasn't arrived yet: land approximately now,
+            // and correct once it does.
+            seekedWithoutAnchor = true;
+          }
+          if (target != null) {
+            seekToTarget(target);
+          }
+        }
+      };
+      hls.on(Hls.Events.LEVEL_UPDATED, onLevelUpdated);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         if (!localRef.current) {
           return;
@@ -348,6 +486,15 @@ export function HLSPlayer(props: VideoProps) {
       };
     } else if (localRef.current.canPlayType("application/vnd.apple.mpegurl")) {
       localRef.current.src = props.url;
+      if (seekInput.current.watchStartTime != null) {
+        localRef.current.addEventListener(
+          "loadedmetadata",
+          seekElementToStart,
+          {
+            once: true,
+          },
+        );
+      }
       localRef.current.addEventListener("canplay", () => {
         if (!localRef.current) {
           return;

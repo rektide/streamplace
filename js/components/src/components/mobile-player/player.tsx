@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { flex, h, layout, w, zIndex } from "../../lib/theme/atoms";
 import {
   PlayerStatus,
   PlayerStatusTracker,
   usePlayerStore,
+  useSetWatchStartTime,
 } from "../../player-store";
 import {
   useMuted,
@@ -28,6 +29,7 @@ export function Player(
 
   const setReportingURL = usePlayerStore((x) => x.setReportingURL);
   const setEmbedded = usePlayerStore((x) => x.setEmbedded);
+  const setWatchStartTime = useSetWatchStartTime();
 
   const reportModalOpen = usePlayerStore((x) => x.reportModalOpen);
   const setReportModalOpen = usePlayerStore((x) => x.setReportModalOpen);
@@ -57,6 +59,13 @@ export function Player(
   useEffect(() => {
     setEmbedded(props.embedded ?? false);
   }, [props.embedded]);
+
+  // Layout effect: sync the store before children's effects run, so a
+  // temporal reference can steer the initial protocol choice (WebRTC → HLS)
+  // without ever mounting the WebRTC player.
+  useLayoutEffect(() => {
+    setWatchStartTime(props.watchStartTime ?? null);
+  }, [props.watchStartTime]);
 
   // Will call back every few seconds to send health updates
   usePlayerStatus();
